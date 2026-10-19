@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tmaxer: one orchestrator and N workers in tmux, coordinated through files and Copilot hooks. See PLAN.md.
+# tmaxer: one orchestrator and N workers in tmux, coordinated through files and Copilot hooks. See README.md.
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SELF="$ROOT/$(basename "${BASH_SOURCE[0]}")"

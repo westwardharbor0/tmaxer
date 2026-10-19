@@ -146,6 +146,25 @@ test_gate_hard_deny_no_event() {
   [ "$(decision "$out")" = deny ] && [ -z "$(events_in "$d")" ]
 }
 
+test_env_overrides_are_read() {
+  local out
+  out=$(env TMAXER_AGENT_CMD="$HERE/fake_agent.sh --x" TMAXER_APPROVAL_TIMEOUT=7 TMAXER_ORCH_MODEL=om-test \
+    TMAXER_WORKER_MODEL=wm-test TMAXER_HOME=/tmp/tmaxer-home-test \
+    bash -c ". '$HERE/../tmaxer'; printf '%s|%s|%s|%s|%s' \"\$AGENT_CMD\" \"\$APPROVAL_TIMEOUT\" \"\$ORCH_MODEL\" \"\$WORKER_MODEL\" \"\$TMAXER_HOME\"")
+  [ "$out" = "$HERE/fake_agent.sh --x|7|om-test|wm-test|/tmp/tmaxer-home-test" ]
+}
+
+test_env_models_reach_launchers() {
+  local repo="$TMP/repo-models" ok=0
+  git init -q "$repo" && echo hi > "$repo/README.md" && git -C "$repo" add README.md \
+    && git -C "$repo" -c user.email=t@example.com -c user.name=test commit -qm init || return 1
+  TMAXER_ORCH_MODEL=orch-env TMAXER_WORKER_MODEL=worker-env bash "$HERE/../tmaxer" up 3 --repo "$repo" --name em >/dev/null || return 1
+  grep -qF -e "--model 'orch-env'" "$TMAXER_HOME/em/run-orchestrator.sh" \
+    && grep -qF -e "--model 'worker-env'" "$TMAXER_HOME/em/run-w1.sh" && ok=1
+  bash "$HERE/../tmaxer" down --name em >/dev/null
+  [ "$ok" = 1 ]
+}
+
 test_launcher_accepts_wrapper_arguments() {
   local d="$TMP/launcher-wrap" saved=$AGENT_CMD
   mkdir -p "$d"
@@ -384,6 +403,8 @@ check "gate allows in-scope shell without events" test_gate_in_scope
 check "gate allows in-scope writes without events" test_gate_write_in_scope
 check "gate denies hard-deny commands without events" test_gate_hard_deny_no_event
 check "orchestrator launcher allows writes to scope files" test_launcher_allows_scope_files
+check "TMAXER_* variables override the defaults" test_env_overrides_are_read
+check "model variables reach the launched agents" test_env_models_reach_launchers
 check "launchers pass wrapper arguments through" test_launcher_accepts_wrapper_arguments
 check "up rejects a missing agent command" test_up_rejects_missing_agent
 check "gate lets a worker read its task and write its own result" test_gate_own_protocol_paths
