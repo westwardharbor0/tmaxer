@@ -1,0 +1,571 @@
+#!/usr/bin/env bash
+# tmaxer: one orchestrator and N workers in tmux, coordinated through files and Copilot hooks. See PLAN.md.
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SELF="$ROOT/$(basename "${BASH_SOURCE[0]}")"
+TMAXER_HOME="${TMAXER_HOME:-$HOME/.tmaxer}"
+AGENT_CMD="${TMAXER_AGENT_CMD:-copilot}"
+APPROVAL_TIMEOUT="${TMAXER_APPROVAL_TIMEOUT:-900}"
+ORCH_MODEL="${TMAXER_ORCH_MODEL:-gpt-6-sol}"
+WORKER_MODEL="${TMAXER_WORKER_MODEL:-claude-haiku-5.5}"
+NL=$'\n'
+
+die() { echo "tmaxer: $*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "$1 is required"; }
+
+usage() {
+  cat <<'USAGE'
+usage: tmaxer up N --repo PATH [--name NAME] [--orch-model M] [--worker-model M]
+       tmaxer send <worker> "<task>" [--scope FILE]
+       tmaxer wait
+       tmaxer decide <approval id> allow | deny <reason>
+       tmaxer down [--name NAME]
+USAGE
+}
+
+# Number of worker columns: 1 for N<=3, 2 for N<=6, 3 for N<=9.
+grid_cols() {
+  if [ "$1" -le 3 ]; then echo 1; elif [ "$1" -le 6 ]; then echo 2; else echo 3; fi
+}
+
+# Shell metacharacters that would let a scope prefix be extended by chaining.
+has_metachar() {
+  case "$1" in *"$NL"*) return 0 ;; esac
+  printf '%s' "$1" | grep -q '[;&|`<>$()]'
+}
+
+hard_deny() {
+  printf '%s\n' "$1" | grep -E -q \
+    -e '(^|[;&|[:space:]])sudo([[:space:]]|$)' \
+    -e 'rm[[:space:]]+-[a-zA-Z]*[rR][a-zA-Z]*[[:space:]]+/([[:space:]]|$)' \
+    -e '\|[[:space:]]*(sh|bash|zsh)([[:space:]]|$)' \
+    -e '(\.ssh|\.aws|\.gnupg|Library/Keychains)' \
+    -e 'git[[:space:]]+push[[:space:]].*(--force|-f)([[:space:]]|$)'
+}
+
+hard_deny_path() {
+  printf '%s\n' "$1" | grep -E -q -e '(\.ssh|\.aws|\.gnupg|Keychains|/etc/)' -e '\.(zshrc|bashrc|profile)$'
+}
+
+# Prints the path relative to cwd. Fails for paths outside cwd or containing "..".
+relpath() {
+  local p=$1 c=$2
+  case "$p" in
+    "$c"/*) p=${p#"$c"/} ;;
+    /*) return 1 ;;
+  esac
+  case "$p" in ''|/*|*..*) return 1 ;; esac
+  printf '%s' "$p"
+}
+
+# Succeeds if the current task's scope file allows this call.
+in_scope() { # tool cmd path cwd
+  local tool=$1 cmd=$2 path=$3 cwd=$4 id scope line pat rel
+  [ -f "$TMAXER_DIR/current/$TMAXER_WORKER" ] || return 1
+  id=$(cat "$TMAXER_DIR/current/$TMAXER_WORKER")
+  scope="$TMAXER_DIR/tasks/$TMAXER_WORKER/$id.scope"
+  [ -f "$scope" ] || return 1
+  if [ "$tool" = bash ]; then
+    [ -n "$cmd" ] || return 1
+    has_metachar "$cmd" && return 1
+    while IFS= read -r line; do
+      case "$line" in
+        "shell: "*) pat=${line#shell: }; case "$cmd" in $pat) return 0 ;; esac ;;
+      esac
+    done < "$scope"
+    return 1
+  fi
+  [ -n "$path" ] || return 1
+  rel=$(relpath "$path" "$cwd") || return 1
+  while IFS= read -r line; do
+    case "$line" in
+      "write: "*) pat=${line#write: }; case "$rel" in $pat) return 0 ;; esac ;;
+    esac
+  done < "$scope"
+  return 1
+}
+
+validate_scope() { # file
+  local line pat first
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -z "$line" ] && continue
+    case "$line" in
+      "shell: "*)
+        pat=${line#shell: }
+        case "$pat" in ''|'*') echo "scope: 'shell: *' is not allowed; list the commands" >&2; return 1 ;; esac
+        if has_metachar "$pat"; then
+          echo "scope: shell patterns may not contain ; & | < > \$ ( ) or backticks: $pat" >&2; return 1
+        fi
+        first=${pat%% *}
+        case "$first" in *[*?[]*) echo "scope: the first word of a shell pattern must be literal: $pat" >&2; return 1 ;; esac
+        case "$first" in
+          curl|wget|ssh|scp|sudo|rm|chmod|chown|docker|bash|sh|zsh|eval|exec|env|xargs|python|python3|node)
+            echo "scope: '$first' needs a human-written scope file" >&2; return 1 ;;
+        esac
+        case "$pat" in "git push"*) echo "scope: 'git push' needs a human-written scope file" >&2; return 1 ;; esac
+        ;;
+      "write: "*)
+        pat=${line#write: }
+        case "$pat" in ''|/*|*..*) echo "scope: write paths must be relative and cannot contain '..': $pat" >&2; return 1 ;; esac
+        ;;
+      *) echo "scope: unknown line (use 'shell: <pattern>' or 'write: <pattern>'): $line" >&2; return 1 ;;
+    esac
+  done < "$1"
+  return 0
+}
+
+emit() { # decision [reason]
+  local out
+  if [ -n "${2:-}" ]; then
+    out=$(jq -cn --arg d "$1" --arg r "$2" '{permissionDecision: $d, permissionDecisionReason: $r}')
+  else
+    out=$(jq -cn --arg d "$1" '{permissionDecision: $d}')
+  fi
+  printf '%s\n' "$out"
+  if [ -n "${AUDIT_WHAT:-}" ]; then
+    printf '%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$TMAXER_WORKER" "$1" \
+      "$(printf '%s' "$AUDIT_WHAT" | tr '\n\t' '  ')" >> "$TMAXER_DIR/audit.log"
+  fi
+}
+
+set_title() {
+  [ -n "${TMUX_PANE:-}" ] && [ -n "${TMAXER_SOCK:-}" ] || return 0
+  tmux -L "$TMAXER_SOCK" select-pane -t "$TMUX_PANE" -T "$TMAXER_WORKER $1" >/dev/null 2>&1
+  return 0
+}
+
+# Writes an event atomically. `tmaxer wait` polls for it.
+queue_event() { # kind suffix json
+  local f="$TMAXER_DIR/events/$1-$TMAXER_WORKER-$2.json"
+  printf '%s\n' "$3" > "$f.tmp" && mv "$f.tmp" "$f"
+  return 0
+}
+
+# Lets a worker read its own task file and write its own result file without asking.
+own_protocol() { # tool cmd path
+  case "$1" in
+    create|edit)
+      case "$3" in *..*) return 1 ;; esac
+      case "$3" in "$TMAXER_DIR/results/$TMAXER_WORKER-"*.md) return 0 ;; esac
+      ;;
+    bash)
+      case "$2" in *..*) return 1 ;; esac
+      case "$2" in
+        "cat $TMAXER_DIR/tasks/$TMAXER_WORKER/"*)
+          if has_metachar "$2"; then return 1; fi
+          return 0 ;;
+      esac
+      ;;
+  esac
+  return 1
+}
+
+hook_pre_tool_use() {
+  local in tool cwd cmd path key id dec r i
+  in=$(cat)
+  tool=$(printf '%s' "$in" | jq -r '.toolName // empty' 2>/dev/null)
+  cwd=$(printf '%s' "$in" | jq -r '.cwd // empty' 2>/dev/null)
+  cmd=$(printf '%s' "$in" | jq -r '(.toolArgs | if type == "string" then fromjson else . end) | .command // empty' 2>/dev/null)
+  path=$(printf '%s' "$in" | jq -r '(.toolArgs | if type == "string" then fromjson else . end) | .path // empty' 2>/dev/null)
+  case "$tool" in view|glob|grep|rg) emit allow; return 0 ;; esac
+  AUDIT_WHAT="$tool ${cmd:-$path}"
+  if [ "$tool" = bash ] && [ -z "$cmd" ]; then emit deny "tmaxer: could not read the command"; return 0; fi
+  if [ -n "$cmd" ] && hard_deny "$cmd"; then emit deny "tmaxer policy: this command is never allowed"; return 0; fi
+  if [ -n "$path" ] && hard_deny_path "$path"; then emit deny "tmaxer policy: this path is never allowed"; return 0; fi
+  if own_protocol "$tool" "$cmd" "$path"; then emit allow; return 0; fi
+  if in_scope "$tool" "$cmd" "$path" "$cwd"; then emit allow; return 0; fi
+  key=$cmd
+  [ "$tool" = bash ] || key="$tool $path"
+  if [ -f "$TMAXER_DIR/denied/$TMAXER_WORKER" ] && grep -Fxq -- "$key" "$TMAXER_DIR/denied/$TMAXER_WORKER"; then
+    emit deny "tmaxer: this exact action was already denied; do not retry it"
+    return 0
+  fi
+  id="a$(date +%s)$$"
+  set_title "waiting-approval"
+  queue_event approval "$id" "$(jq -cn --arg id "$id" --arg w "$TMAXER_WORKER" --arg tool "$tool" \
+    --arg cmd "$cmd" --arg path "$path" '{kind: "approval", id: $id, worker: $w, tool: $tool, command: $cmd, path: $path}')"
+  i=0
+  while [ "$i" -lt "$APPROVAL_TIMEOUT" ]; do
+    if [ -s "$TMAXER_DIR/decisions/$id" ]; then
+      dec=$(head -n 1 "$TMAXER_DIR/decisions/$id")
+      set_title "busy"
+      case "$dec" in
+        allow*) emit allow ;;
+        deny*)
+          r=${dec#deny}; r=${r# }
+          emit deny "orchestrator: ${r:-denied}"
+          printf '%s\n' "$key" >> "$TMAXER_DIR/denied/$TMAXER_WORKER"
+          ;;
+        *)
+          emit deny "orchestrator: $dec"
+          printf '%s\n' "$key" >> "$TMAXER_DIR/denied/$TMAXER_WORKER"
+          ;;
+      esac
+      return 0
+    fi
+    sleep 1
+    i=$((i + 1))
+  done
+  set_title "busy"
+  emit deny "tmaxer: no approval within the deadline"
+}
+
+hook_agent_stop() {
+  local in active task res status kind body
+  in=$(cat)
+  active=$(printf '%s' "$in" | jq -r '.stop_hook_active // false' 2>/dev/null)
+  [ -f "$TMAXER_DIR/current/$TMAXER_WORKER" ] || return 0
+  task=$(cat "$TMAXER_DIR/current/$TMAXER_WORKER")
+  res="$TMAXER_DIR/results/$TMAXER_WORKER-$task.md"
+  if [ ! -s "$res" ]; then
+    if [ "$active" != true ]; then
+      jq -cn --arg r "Write your result to $res. Its first line must be status: done or status: blocked. Then end your turn." \
+        '{decision: "block", reason: $r}'
+      return 0
+    fi
+    kind=blocked
+    body="no result file was written"
+  else
+    status=$(head -n 1 "$res" | sed -e 's/^status:[[:space:]]*//' -e 's/[[:space:]]*$//')
+    case "$status" in done) kind=done ;; *) kind=blocked ;; esac
+    body=$res
+  fi
+  rm -f "$TMAXER_DIR/current/$TMAXER_WORKER"
+  set_title "$kind"
+  queue_event "$kind" "$task" "$(jq -cn --arg k "$kind" --arg w "$TMAXER_WORKER" --arg t "$task" --arg b "$body" \
+    '{kind: $k, worker: $w, task: $t, detail: $b}')"
+  return 0
+}
+
+hook_event() { # kind
+  local in payload
+  in=$(cat)
+  payload=$(printf '%s' "$in" | jq -c '.' 2>/dev/null)
+  [ -n "$payload" ] || payload=null
+  queue_event "$1" "$(date +%s)$$" "$(jq -cn --arg k "$1" --arg w "$TMAXER_WORKER" --argjson p "$payload" \
+    '{kind: $k, worker: $w, payload: $p}')"
+  return 0
+}
+
+cmd_hook() {
+  [ -n "${TMAXER_DIR:-}" ] && [ -n "${TMAXER_WORKER:-}" ] || die "hook needs TMAXER_DIR and TMAXER_WORKER"
+  case "${1:-}" in
+    pre-tool-use) hook_pre_tool_use ;;
+    agent-stop) hook_agent_stop ;;
+    session-end) hook_event exited ;;
+    error) hook_event error ;;
+    *) die "unknown hook: ${1:-}" ;;
+  esac
+}
+
+session_from_env() {
+  [ -n "${TMAXER_DIR:-}" ] || die "TMAXER_DIR is not set; run this from a tmaxer pane or export TMAXER_DIR"
+  [ -d "$TMAXER_DIR/tasks" ] || die "$TMAXER_DIR is not a tmaxer session"
+  SOCK=${TMAXER_SOCK:-}
+}
+
+tmux_up() { [ -n "${SOCK:-}" ] && tmux -L "$SOCK" has-session -t "$SOCK" 2>/dev/null; }
+
+cmd_send() {
+  local w=${1:-} text=${2:-} scope="" id res pane nudge
+  shift $(( $# < 2 ? $# : 2 ))
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --scope) scope=${2:-}; shift 2 ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  [ -n "$w" ] && [ -n "$text" ] || die 'usage: tmaxer send <worker> "<task>" [--scope FILE]'
+  session_from_env
+  [ "$w" != orchestrator ] && grep -q "^$w " "$TMAXER_DIR/panes" 2>/dev/null || die "unknown worker: $w"
+  [ -e "$TMAXER_DIR/current/$w" ] && die "worker $w is busy; wait for its event first"
+  if [ -n "$scope" ]; then
+    [ -f "$scope" ] || die "scope file not found: $scope"
+    validate_scope "$scope" || die "invalid scope file"
+  fi
+  id="t$(date +%s)$RANDOM"
+  mkdir -p "$TMAXER_DIR/tasks/$w"
+  printf '%s\n' "$text" > "$TMAXER_DIR/tasks/$w/$id.md"
+  if [ -n "$scope" ]; then cp "$scope" "$TMAXER_DIR/tasks/$w/$id.scope"; else : > "$TMAXER_DIR/tasks/$w/$id.scope"; fi
+  printf '%s\n' "$id" > "$TMAXER_DIR/current/$w"
+  res="$TMAXER_DIR/results/$w-$id.md"
+  nudge="Read the task in $TMAXER_DIR/tasks/$w/$id.md and carry it out. When finished, write your result to $res with first line status: done or status: blocked, then end your turn."
+  pane=$(awk -v w="$w" '$1 == w {print $2}' "$TMAXER_DIR/panes")
+  if [ -n "$pane" ] && tmux_up; then
+    tmux -L "$SOCK" select-pane -t "$pane" -T "$w busy"
+    tmux -L "$SOCK" send-keys -t "$pane" -l "$nudge"
+    sleep 1
+    tmux -L "$SOCK" send-keys -t "$pane" Enter
+    sleep 3
+    if ! tmux -L "$SOCK" capture-pane -p -t "$pane" | grep -q 'Working'; then
+      tmux -L "$SOCK" send-keys -t "$pane" Enter
+    fi
+  fi
+  echo "$id"
+}
+
+cmd_wait() {
+  local n f
+  session_from_env
+  while :; do
+    n=0
+    for f in "$TMAXER_DIR"/events/*.json; do
+      [ -e "$f" ] || continue
+      cat "$f"
+      mv "$f" "$TMAXER_DIR/consumed/"
+      n=$((n + 1))
+    done
+    [ "$n" -gt 0 ] && return 0
+    tmux_up || return 1
+    sleep 2
+  done
+}
+
+cmd_pane_died() {
+  local pane=${1:-} w
+  session_from_env
+  w=$(awk -v p="$pane" '$2 == p {print $1}' "$TMAXER_DIR/panes" 2>/dev/null)
+  [ -n "$w" ] || return 0
+  TMAXER_WORKER=$w
+  queue_event pane-died "$(date +%s)$$" "$(jq -cn --arg w "$w" '{kind: "pane-died", worker: $w}')"
+}
+
+# Splits the window into the orchestrator (left) and a worker grid (right). Prints worker pane IDs, row-major.
+build_layout() { # socket orchestrator-pane workers
+  local t="tmux -L $1" orch=$2 n=$3 c rows k x new left cnt row rowlist="" cells=""
+  c=$(grid_cols "$n")
+  rows=$(( (n + c - 1) / c ))
+  x=$($t split-window -h -p 55 -P -F '#{pane_id}' -t "$orch") || return 1
+  k=$rows
+  while [ "$k" -gt 1 ]; do
+    new=$($t split-window -v -p $(( (k - 1) * 100 / k )) -P -F '#{pane_id}' -t "$x") || return 1
+    rowlist="$rowlist $x"
+    x=$new
+    k=$((k - 1))
+  done
+  rowlist="$rowlist $x"
+  left=$n
+  for row in $rowlist; do
+    cnt=$(( left < c ? left : c ))
+    left=$((left - cnt))
+    x=$row
+    k=$cnt
+    while [ "$k" -gt 1 ]; do
+      new=$($t split-window -h -p $(( (k - 1) * 100 / k )) -P -F '#{pane_id}' -t "$x") || return 1
+      cells="$cells $x"
+      x=$new
+      k=$((k - 1))
+    done
+    cells="$cells $x"
+  done
+  printf '%s\n' $cells
+}
+
+write_plugin() { # dir
+  local d=$1
+  printf '%s\n' '{' '  "name": "tmaxer-worker",' '  "version": "0.1.0",' '  "description": "tmaxer worker hooks"' '}' > "$d/plugin/plugin.json"
+  jq -n --arg c "\"$SELF\"" '{
+    version: 1,
+    hooks: {
+      preToolUse: [{type: "command", bash: ($c + " hook pre-tool-use"), timeoutSec: 960}],
+      agentStop: [{type: "command", bash: ($c + " hook agent-stop"), timeoutSec: 30}],
+      sessionEnd: [{type: "command", bash: ($c + " hook session-end"), timeoutSec: 10}],
+      errorOccurred: [{type: "command", bash: ($c + " hook error"), timeoutSec: 10}]
+    }
+  }' > "$d/plugin/hooks.json"
+}
+
+write_launchers() { # dir name orch-model worker-model workers
+  local d=$1 name=$2 om=$3 wm=$4 n=$5 i
+  cat > "$d/run-orchestrator.sh" <<EOF
+#!/usr/bin/env bash
+export TMAXER_DIR='$d' TMAXER_SOCK='tmaxer-$name' TMAXER_WORKER=orchestrator
+'$AGENT_CMD' --model '$om' --add-dir '$d' --allow-tool 'shell($SELF:*)' --allow-tool 'shell(git:*)' --allow-tool 'write($d/scopes/*)' -i "\$(cat '$d/orchestrator-prompt.md')"
+'$SELF' down --name '$name'
+EOF
+  for i in $(seq 1 "$n"); do
+    cat > "$d/run-w$i.sh" <<EOF
+#!/usr/bin/env bash
+export TMAXER_DIR='$d' TMAXER_SOCK='tmaxer-$name' TMAXER_WORKER='w$i' TMAXER_APPROVAL_TIMEOUT='$APPROVAL_TIMEOUT'
+exec '$AGENT_CMD' --model '$wm' --plugin-dir '$d/plugin' -i "\$(cat '$d/worker-prompt.md')"
+EOF
+  done
+  chmod +x "$d"/run-*.sh
+}
+
+# Adds or removes folders in the trustedFolders list of Copilot's config.json (JSONC, comment header kept).
+trust_edit() { # add|remove paths...
+  local action=$1
+  shift
+  python3 - "$action" "$@" <<'PY'
+import json, os, stat, sys
+action, paths = sys.argv[1], [os.path.realpath(p) for p in sys.argv[2:]]
+home = os.environ.get('COPILOT_HOME') or os.path.expanduser('~/.copilot')
+path = os.path.join(home, 'config.json')
+raw = open(path).read() if os.path.exists(path) else ''
+lines = raw.splitlines()
+header = []
+while lines and lines[0].lstrip().startswith('//'):
+    header.append(lines.pop(0))
+if any(l.lstrip().startswith('//') for l in lines):
+    sys.exit('tmaxer: config.json has comments inside its body; not editing it')
+body = '\n'.join(lines)
+data = json.loads(body) if body.strip() else {}
+folders = list(data.get('trustedFolders', []))
+if action == 'add':
+    folders += [p for p in paths if p not in folders]
+else:
+    folders = [f for f in folders if f not in paths]
+data['trustedFolders'] = folders
+out = '\n'.join(header + [json.dumps(data, indent=2)]) + '\n'
+os.makedirs(home, exist_ok=True)
+mode = stat.S_IMODE(os.stat(path).st_mode) if os.path.exists(path) else 0o600
+tmp = path + '.tmaxer-tmp'
+with open(tmp, 'w') as f:
+    f.write(out)
+os.chmod(tmp, mode)
+os.replace(tmp, path)
+PY
+}
+
+cmd_up() {
+  local n=${1:-} repo="" name=default orch_model=$ORCH_MODEL worker_model=$WORKER_MODEL
+  local D SOCK i root_pane cells cell
+  [ $# -gt 0 ] && shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo) repo=${2:-}; shift 2 ;;
+      --name) name=${2:-}; shift 2 ;;
+      --orch-model) orch_model=${2:-}; shift 2 ;;
+      --worker-model) worker_model=${2:-}; shift 2 ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  case "$n" in ''|*[!0-9]*) die "N must be a number from 3 to 9" ;; esac
+  [ "$n" -ge 3 ] && [ "$n" -le 9 ] || die "N must be from 3 to 9, got $n"
+  case "$name" in ''|*[!A-Za-z0-9_-]*) die "--name may only contain letters, digits, _ and -" ;; esac
+  [ -n "$repo" ] || die "--repo PATH is required"
+  need jq; need tmux; need git; need python3
+  repo=$(cd "$repo" 2>/dev/null && pwd -P) || die "repo not found: $repo"
+  git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 || die "$repo is not a git repository"
+  git -C "$repo" rev-parse --verify -q HEAD >/dev/null || die "$repo has no commits yet"
+  D="$TMAXER_HOME/$name"
+  SOCK="tmaxer-$name"
+  [ -e "$D" ] && die "$D already exists; run 'tmaxer down --name $name' or choose another --name"
+  for b in review $(seq -f 'w%g' 1 "$n"); do
+    git -C "$repo" show-ref --verify --quiet "refs/heads/tmaxer/$name/$b" \
+      && die "branch tmaxer/$name/$b exists from an earlier session; choose another --name"
+  done
+  mkdir -p "$D/tasks" "$D/results" "$D/events" "$D/consumed" "$D/decisions" "$D/current" "$D/denied" "$D/plugin" "$D/wt" \
+    || die "cannot create $D"
+  printf '%s\n' "$name" > "$D/name"
+  printf '%s\n' "$repo" > "$D/repo"
+  write_plugin "$D"
+  for i in $(seq 1 "$n"); do
+    git -C "$repo" worktree add -q -b "tmaxer/$name/w$i" "$D/wt/w$i" HEAD || die "could not create worktree w$i"
+  done
+  git -C "$repo" worktree add -q -b "tmaxer/$name/review" "$D/wt/review" HEAD || die "could not create the review worktree"
+  trust_edit add "$D"/wt/* || die "could not add the worktrees to Copilot trusted folders"
+  write_launchers "$D" "$name" "$orch_model" "$worker_model" "$n"
+  cp "$ROOT/prompts/worker.md" "$D/worker-prompt.md"
+  {
+    cat "$ROOT/prompts/orchestrator.md"
+    echo
+    echo "## This session"
+    echo "- tmaxer command: $SELF"
+    echo "- Your shell has TMAXER_DIR set, so tmaxer commands need no --name."
+    echo "- Review worktree (merge target): $D/wt/review, branch tmaxer/$name/review"
+    echo "- Workers:"
+    for i in $(seq 1 "$n"); do echo "  - w$i: worktree $D/wt/w$i, branch tmaxer/$name/w$i"; done
+    echo "- Session: open. The human sends requests over time in this chat. There is no single goal."
+  } > "$D/orchestrator-prompt.md"
+  mkdir -p "$D/scopes"
+
+  root_pane=$(tmux -L "$SOCK" new-session -d -s "$SOCK" -n orchestrator -x 220 -y 60 -c "$D/wt/review" -P -F '#{pane_id}' \
+    "bash '$D/run-orchestrator.sh'") || die "could not start tmux"
+  tmux -L "$SOCK" set-option -g set-titles on
+  tmux -L "$SOCK" set-option -g set-titles-string "#S #W"
+  tmux -L "$SOCK" set-option -w -t "$SOCK" remain-on-exit on
+  tmux -L "$SOCK" set-option -w -t "$SOCK" pane-border-status top
+  tmux -L "$SOCK" set-option -w -t "$SOCK" pane-border-format ' #{pane_title} '
+  tmux -L "$SOCK" set-hook -g pane-died "run-shell -b \"TMAXER_DIR='$D' TMAXER_SOCK='$SOCK' '$SELF' pane-died '#{pane_id}'\""
+  tmux -L "$SOCK" select-pane -t "$root_pane" -T orchestrator
+  printf 'orchestrator %s\n' "$root_pane" > "$D/panes"
+  cells=$(build_layout "$SOCK" "$root_pane" "$n") || die "could not build the layout"
+  i=1
+  for cell in $cells; do
+    tmux -L "$SOCK" respawn-pane -k -t "$cell" -c "$D/wt/w$i" "bash '$D/run-w$i.sh'"
+    tmux -L "$SOCK" select-pane -t "$cell" -T "w$i idle"
+    printf 'w%s %s\n' "$i" "$cell" >> "$D/panes"
+    i=$((i + 1))
+  done
+  echo "started $name: orchestrator + $n workers"
+  echo "attach with: tmux -L $SOCK attach -t $SOCK"
+  if [ -t 0 ] && [ -t 1 ]; then exec tmux -L "$SOCK" attach -t "$SOCK"; fi
+}
+
+cmd_down() {
+  local name=default D SOCK repo wt removed=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name) name=${2:-}; shift 2 ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  D="$TMAXER_HOME/$name"
+  SOCK="tmaxer-$name"
+  [ -d "$D" ] || die "no session named $name in $TMAXER_HOME"
+  repo=$(cat "$D/repo")
+  for wt in "$D"/wt/*; do
+    [ -d "$wt" ] || continue
+    if [ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ]; then
+      echo "kept $wt: it has uncommitted changes" >&2
+      continue
+    fi
+    if git -C "$repo" worktree remove "$wt" >/dev/null 2>&1; then
+      removed="$removed $wt"
+    else
+      echo "could not remove $wt" >&2
+    fi
+  done
+  # shellcheck disable=SC2086
+  [ -n "$removed" ] && trust_edit remove $removed
+  # Last: this may run inside a pane of the server being stopped.
+  tmux -L "$SOCK" kill-server >/dev/null 2>&1
+  archive="$TMAXER_HOME/archive/$name-$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$TMAXER_HOME/archive" && mv "$D" "$archive"
+  echo "stopped $name; branches kept; state archived to $archive"
+}
+
+cmd_decide() { # <approval id> allow | deny <reason>
+  local id=${1:-} verdict=${2:-} text
+  shift $(( $# < 2 ? $# : 2 ))
+  session_from_env
+  case "$id" in a[0-9]*) ;; *) die "unknown approval id: $id" ;; esac
+  case "$verdict" in
+    allow) text=allow ;;
+    deny) text="deny $*" ;;
+    *) die 'usage: tmaxer decide <approval id> allow | deny <reason>' ;;
+  esac
+  printf '%s\n' "$text" > "$TMAXER_DIR/decisions/$id.tmp" && mv "$TMAXER_DIR/decisions/$id.tmp" "$TMAXER_DIR/decisions/$id"
+  echo "decided $id: $text"
+}
+
+main() {
+  local cmd=${1:-}
+  [ $# -gt 0 ] && shift
+  case "$cmd" in
+    up) cmd_up "$@" ;;
+    send) cmd_send "$@" ;;
+    wait) cmd_wait "$@" ;;
+    down) cmd_down "$@" ;;
+    hook) cmd_hook "$@" ;;
+    pane-died) cmd_pane_died "$@" ;;
+    decide) cmd_decide "$@" ;;
+    *) usage; exit 1 ;;
+  esac
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi
