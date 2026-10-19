@@ -363,6 +363,20 @@ test_ctrl_d_orchestrator_ends_session() {
   return 0
 }
 
+test_down_keeps_dirty_worktree_clean() {
+  local repo="$TMP/repo-dirty"
+  git init -q "$repo" && echo hi > "$repo/README.md" && git -C "$repo" add README.md \
+    && git -C "$repo" -c user.email=t@example.com -c user.name=test commit -qm init || return 1
+  bash "$HERE/../tmaxer" up 3 --repo "$repo" --name dd >/dev/null || return 1
+  echo unsaved > "$TMAXER_HOME/dd/wt/w2/unsaved.txt"
+  bash "$HERE/../tmaxer" down --name dd >/dev/null || return 1
+  local archive
+  archive=$(ls -d "$TMAXER_HOME"/archive/dd-* | tail -1)
+  [ -f "$archive/wt/w2/unsaved.txt" ] || return 1
+  [ "$(grep -c 'dd/wt' "$COPILOT_HOME/config.json")" = 0 ] || return 1
+  ! git -C "$repo" worktree list | grep -q '/dd/wt/'
+}
+
 test_up_refuses_reused_branch() {
   local repo="$TMP/repo-branch"
   git init -q "$repo" || return 1
@@ -424,6 +438,7 @@ check "decide writes an atomic decision file" test_decide_writes_decision
 check "wait prints and consumes queued events" test_wait_drains_events
 check "wait fails when nothing is queued" test_wait_without_events_fails
 check "up rejects N outside 3..9" test_up_validates_n
+check "down keeps a dirty worktree and leaves git and trust clean" test_down_keeps_dirty_worktree_clean
 check "up refuses a branch name left by an earlier session" test_up_refuses_reused_branch
 check "tmux layout, trust, pane-died event, and down" test_layout_pane_died_and_down
 check "Ctrl-D in the orchestrator ends the whole session" test_ctrl_d_orchestrator_ends_session

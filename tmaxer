@@ -507,7 +507,7 @@ cmd_up() {
 }
 
 cmd_down() {
-  local name=default D SOCK repo wt removed=""
+  local name=default D SOCK repo wt w archive all="" kept=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --name) name=${2:-}; shift 2 ;;
@@ -520,23 +520,27 @@ cmd_down() {
   repo=$(cat "$D/repo")
   for wt in "$D"/wt/*; do
     [ -d "$wt" ] || continue
+    all="$all $wt"
     if [ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ]; then
-      echo "kept $wt: it has uncommitted changes" >&2
+      kept="$kept ${wt##*/}"
       continue
     fi
-    if git -C "$repo" worktree remove "$wt" >/dev/null 2>&1; then
-      removed="$removed $wt"
-    else
-      echo "could not remove $wt" >&2
-    fi
+    git -C "$repo" worktree remove "$wt" >/dev/null 2>&1 || echo "could not remove $wt" >&2
   done
   # shellcheck disable=SC2086
-  [ -n "$removed" ] && trust_edit remove $removed
-  # Last: this may run inside a pane of the server being stopped.
-  tmux -L "$SOCK" kill-server >/dev/null 2>&1
+  [ -n "$all" ] && trust_edit remove $all
   archive="$TMAXER_HOME/archive/$name-$(date +%Y%m%d-%H%M%S)"
-  mkdir -p "$TMAXER_HOME/archive" && mv "$D" "$archive"
+  mkdir -p "$TMAXER_HOME/archive" && mv "$D" "$archive" || die "could not archive $D"
+  for w in $kept; do
+    git -C "$repo" worktree repair "$archive/wt/$w" >/dev/null 2>&1
+  done
+  [ -n "$kept" ] && git -C "$repo" worktree prune
   echo "stopped $name; branches kept; state archived to $archive"
+  for w in $kept; do
+    echo "kept with uncommitted changes: $archive/wt/$w"
+  done
+  # Last: this may run inside a pane of the server being stopped.
+  tmux -L "$SOCK" kill-server >/dev/null 2>&1 || true
 }
 
 cmd_decide() { # <approval id> allow | deny <reason>
