@@ -71,6 +71,18 @@ Set these as environment variables:
 | `TMAXER_WORKER_MODEL` | `claude-haiku-5.5` | Model for the workers |
 | `TMAXER_APPROVAL_TIMEOUT` | `900` | Seconds before an unanswered approval is denied |
 | `TMAXER_HOME` | `~/.tmaxer` | Where session state is kept |
+| `TMAXER_AGENT_CMD` | `copilot` | Command that starts each agent. It may include arguments. tmaxer appends its own flags. |
+
+## Using a wrapper
+
+To change how Copilot CLI is started, point `TMAXER_AGENT_CMD` at a wrapper script:
+
+```bash
+export TMAXER_AGENT_CMD="$PWD/examples/copilot-wrapper.sh"
+./tmaxer up 3 --repo ~/path/to/your/repo --name demo
+```
+
+The wrapper must pass every argument on to Copilot CLI. Approvals and completion detection rely on Copilot's hooks, so other agents are not supported. The command must not contain spaces in its path, because it is split on spaces. `up` stops early if the command is not found.
 
 ## Safety
 

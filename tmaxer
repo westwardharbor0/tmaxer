@@ -381,14 +381,14 @@ write_launchers() { # dir name orch-model worker-model workers
   cat > "$d/run-orchestrator.sh" <<EOF
 #!/usr/bin/env bash
 export TMAXER_DIR='$d' TMAXER_SOCK='tmaxer-$name' TMAXER_WORKER=orchestrator
-'$AGENT_CMD' --model '$om' --add-dir '$d' --allow-tool 'shell($SELF:*)' --allow-tool 'shell(git:*)' --allow-tool 'write($d/scopes/*)' -i "\$(cat '$d/orchestrator-prompt.md')"
+$AGENT_CMD --model '$om' --add-dir '$d' --allow-tool 'shell($SELF:*)' --allow-tool 'shell(git:*)' --allow-tool 'write($d/scopes/*)' -i "\$(cat '$d/orchestrator-prompt.md')"
 '$SELF' down --name '$name'
 EOF
   for i in $(seq 1 "$n"); do
     cat > "$d/run-w$i.sh" <<EOF
 #!/usr/bin/env bash
 export TMAXER_DIR='$d' TMAXER_SOCK='tmaxer-$name' TMAXER_WORKER='w$i' TMAXER_APPROVAL_TIMEOUT='$APPROVAL_TIMEOUT'
-exec '$AGENT_CMD' --model '$wm' --plugin-dir '$d/plugin' -i "\$(cat '$d/worker-prompt.md')"
+exec $AGENT_CMD --model '$wm' --plugin-dir '$d/plugin' -i "\$(cat '$d/worker-prompt.md')"
 EOF
   done
   chmod +x "$d"/run-*.sh
@@ -447,6 +447,7 @@ cmd_up() {
   case "$name" in ''|*[!A-Za-z0-9_-]*) die "--name may only contain letters, digits, _ and -" ;; esac
   [ -n "$repo" ] || die "--repo PATH is required"
   need jq; need tmux; need git; need python3
+  command -v "${AGENT_CMD%% *}" >/dev/null 2>&1 || die "agent command not found: ${AGENT_CMD%% *}"
   repo=$(cd "$repo" 2>/dev/null && pwd -P) || die "repo not found: $repo"
   git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 || die "$repo is not a git repository"
   git -C "$repo" rev-parse --verify -q HEAD >/dev/null || die "$repo has no commits yet"

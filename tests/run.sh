@@ -146,6 +146,23 @@ test_gate_hard_deny_no_event() {
   [ "$(decision "$out")" = deny ] && [ -z "$(events_in "$d")" ]
 }
 
+test_launcher_accepts_wrapper_arguments() {
+  local d="$TMP/launcher-wrap" saved=$AGENT_CMD
+  mkdir -p "$d"
+  AGENT_CMD="$HERE/fake_agent.sh --wrapped"
+  write_launchers "$d" tt gpt-6-sol claude-haiku-5.5 3
+  AGENT_CMD=$saved
+  grep -qF "$HERE/fake_agent.sh --wrapped --model 'gpt-6-sol'" "$d/run-orchestrator.sh"
+}
+
+test_up_rejects_missing_agent() {
+  local repo="$TMP/repo-noagent"
+  git init -q "$repo" && echo hi > "$repo/README.md" && git -C "$repo" add README.md \
+    && git -C "$repo" -c user.email=t@example.com -c user.name=test commit -qm init || return 1
+  if TMAXER_AGENT_CMD=/no/such/agent bash "$HERE/../tmaxer" up 3 --repo "$repo" --name na >/dev/null 2>&1; then return 1; fi
+  [ ! -d "$TMAXER_HOME/na" ]
+}
+
 test_launcher_allows_scope_files() {
   local d="$TMP/launcher"
   mkdir -p "$d"
@@ -367,6 +384,8 @@ check "gate allows in-scope shell without events" test_gate_in_scope
 check "gate allows in-scope writes without events" test_gate_write_in_scope
 check "gate denies hard-deny commands without events" test_gate_hard_deny_no_event
 check "orchestrator launcher allows writes to scope files" test_launcher_allows_scope_files
+check "launchers pass wrapper arguments through" test_launcher_accepts_wrapper_arguments
+check "up rejects a missing agent command" test_up_rejects_missing_agent
 check "gate lets a worker read its task and write its own result" test_gate_own_protocol_paths
 check "gate asks before another worker's result path" test_gate_other_worker_result_asks
 check "gate asks the orchestrator for chained commands" test_gate_chained_asks
