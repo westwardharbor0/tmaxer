@@ -1,81 +1,93 @@
 # tmaxer
 
-Run one orchestrator agent and 3–9 worker agents in tmux.
+tmaxer runs one orchestrator agent and up to nine worker agents in tmux. You talk to the orchestrator. It splits your requests into tasks, sends them to the workers, decides their approvals, and merges their work.
 
-The orchestrator is a chat you talk to in the left pane. You send it requests over time. It splits each request into tasks, sends each task to an idle worker with a per-task scope, decides approvals, and merges finished branches. Workers sit in the right-hand grid. Each one runs in its own git worktree and branch.
-
-> **Status: experimental.** Tested on macOS with the GitHub Copilot CLI. Expect rough edges.
-
-## How it works
-
-- **Layout:** orchestrator on the left, workers in a grid on the right (1 column for 3 workers, 2 for 4–6, 3 for 7–9).
-- **Isolation:** each worker has a worktree on branch `tmaxer/<name>/w<i>`. A `review` worktree collects merges. `down` keeps the branches.
-- **Messaging:** tasks and results are files. Events are queued as files. `tmaxer wait` blocks until one arrives.
-- **Copilot hooks:** a `preToolUse` hook gates every worker tool call. An `agentStop` hook detects the end of a turn and requires a result file.
-- **Access, in three layers:**
-  1. Global hard-deny patterns: `sudo`, `rm -rf /`, piping into a shell, and credential paths. These always win.
-  2. The task's scope file, written by the orchestrator from the task.
-  3. An orchestrator decision for anything else. These are one-off and don't widen the scope.
-
-Design details are in [PLAN.md](PLAN.md).
+> Status: experimental. Tested on macOS with the GitHub Copilot CLI.
 
 ## Requirements
 
-- bash, tmux, git, jq, python3
-- GitHub Copilot CLI (`copilot`), logged in, with access to the models you choose
-- A git repository with at least one commit to run against
+- tmux, git, jq, python3
+- GitHub Copilot CLI (`copilot`), logged in
+- A git repository with at least one commit
 
 ## Quick start
 
 ```bash
 git clone https://github.com/westwardharbor0/tmaxer
 cd tmaxer
-./tmaxer up 3 --repo /path/to/your/repo --name demo
+./tmaxer up 3 --repo ~/path/to/your/repo --name demo
 ```
 
-`up` attaches to tmux when run in a terminal. Type your requests into the orchestrator pane.
+The first number is the worker count, from 3 to 9. When run from a terminal, `up` opens the tmux session:
 
-- Press Ctrl-D in the orchestrator pane to end the whole session.
+- The orchestrator is on the left. Type your requests there.
+- The workers are on the right.
+
+## Using it
+
+1. Describe what you want in the orchestrator pane. You can send requests one after another.
+2. The orchestrator sends tasks to idle workers. Each worker works in its own git branch.
+3. When a worker finishes, the orchestrator merges its branch into `tmaxer/<name>/review`.
+4. If a worker needs a command outside its task scope, the orchestrator decides whether to allow it.
+5. If Copilot asks you something in a pane, answer it there. Enter selects the highlighted option.
+
+Useful tmux keys:
+
+| Keys | Action |
+|---|---|
+| `Ctrl-b` then arrow | Move between panes |
+| `Ctrl-b` then `z` | Zoom the current pane to full screen, press again to return |
+| `Ctrl-b` then `d` | Detach, leaving the session running |
+
+To reattach later: `tmux -L tmaxer-demo attach -t tmaxer-demo`.
+
+## Stopping
+
+- Press `Ctrl-D` in the orchestrator pane to end the session.
 - Or run `./tmaxer down --name demo` from another terminal.
 
-Ctrl-D in a worker pane stops only that worker. Ending the orchestrator ends the session.
+Stopping removes the worktrees and archives the session state. The branches stay, so you can review or merge them.
 
 ## Commands
 
-| Command | What it does |
+You normally use the orchestrator, not these. They are there for manual control.
+
+| Command | Purpose |
 |---|---|
-| `tmaxer up N --repo PATH [--name NAME] [--orch-model M] [--worker-model M]` | Create worktrees, trust them, start the layout. N must be 3–9. |
-| `tmaxer send <worker> "<task>" [--scope FILE]` | Give a worker a task. Refused while the worker is busy. |
-| `tmaxer wait` | Block until a worker event arrives, then print it. |
-| `tmaxer decide <approval-id> allow` | Allow one pending command. |
-| `tmaxer decide <approval-id> deny <reason>` | Deny one pending command, with a reason the worker sees. |
-| `tmaxer down [--name NAME]` | Stop the session, remove worktrees and trust entries, and archive its state. |
+| `./tmaxer up N --repo PATH [--name NAME]` | Start a session. Options: `--orch-model`, `--worker-model`. |
+| `./tmaxer down [--name NAME]` | Stop a session. |
+| `./tmaxer send WORKER "TASK" [--scope FILE]` | Give a worker a task by hand. |
+| `./tmaxer decide ID allow` | Allow a pending command. |
+| `./tmaxer decide ID deny REASON` | Deny a pending command, with a reason the worker sees. |
+| `./tmaxer wait` | Print the next worker event. |
 
-A scope file has one rule per line:
+## Settings
 
-```
-shell: npm test
-shell: git diff *
-write: src/auth/*
-```
+Set these as environment variables:
 
-`send` rejects scopes that allow `shell: *`, shells, interpreters, `curl`, `ssh`, `rm`, `git push`, and similar. Those need a scope file written by a person.
-
-## Environment
-
-| Variable | Default | Purpose |
+| Variable | Default | Meaning |
 |---|---|---|
-| `TMAXER_ORCH_MODEL` | `gpt-6-sol` | Orchestrator model |
-| `TMAXER_WORKER_MODEL` | `claude-haiku-5.5` | Worker model |
-| `TMAXER_AGENT_CMD` | `copilot` | Agent executable (tests use a fake one) |
+| `TMAXER_ORCH_MODEL` | `gpt-6-sol` | Model for the orchestrator |
+| `TMAXER_WORKER_MODEL` | `claude-haiku-5.5` | Model for the workers |
 | `TMAXER_APPROVAL_TIMEOUT` | `900` | Seconds before an unanswered approval is denied |
-| `TMAXER_HOME` | `~/.tmaxer` | Where session state lives |
+| `TMAXER_HOME` | `~/.tmaxer` | Where session state is kept |
 
-## Files on disk
+## Safety
 
-- `~/.tmaxer/<name>/`: tasks, results, events, decisions, scopes, and `audit.log`. `down` moves this to `~/.tmaxer/archive/`.
-- Git branches `tmaxer/<name>/*`: kept after `down`.
-- `~/.copilot/config.json`: `up` adds the worktrees to `trustedFolders`, and `down` removes them. The file is JSONC, so tmaxer edits it with Python and keeps its comment header and file mode.
+- These are always denied, even if the orchestrator approves them: `sudo`, `rm -rf /`, piping into a shell, and reading credential folders such as `~/.ssh`.
+- Each task has a scope that lists the commands and files it may use. Anything outside the scope needs an approval.
+- tmaxer is not a sandbox. Allowed commands run with your user permissions.
+
+## What it changes on your machine
+
+- `up` adds the worktrees to `trustedFolders` in `~/.copilot/config.json`, so Copilot doesn't stop on a trust prompt. `down` removes them.
+- Session state lives in `~/.tmaxer/<name>/`. A stopped session moves to `~/.tmaxer/archive/`.
+
+## Troubleshooting
+
+- **"already exists" or "branch exists":** choose a new `--name`. Old branches are kept, so a name that was used before can't be reused.
+- **A worker seems stuck:** look at its pane. A pending approval waits up to `TMAXER_APPROVAL_TIMEOUT` seconds.
+- **Usage is high:** every worker and the orchestrator is a full agent session, so each one uses your Copilot quota.
 
 ## Tests
 
@@ -83,15 +95,7 @@ write: src/auth/*
 bash tests/run.sh
 ```
 
-The tests make no model calls. They use a fake agent and a temporary `COPILOT_HOME`, so your real Copilot config is not touched. The suite includes a real tmux layout run.
-
-## Limitations
-
-- **Cost:** the orchestrator and every worker are full agent sessions, so usage adds up quickly.
-- **Not a sandbox:** the patterns above are triage, not isolation. Copilot's `--sandbox` is not wired in yet.
-- **Permission prompts:** in interactive mode, Copilot still asks about some paths. Answer them in the pane.
-- **Hook timeouts fail open** in Copilot. tmaxer therefore enforces its own approval deadline (`TMAXER_APPROVAL_TIMEOUT`).
-- **Untested:** Linux. The script targets bash 3.2, which macOS ships.
+The tests make no model calls. They use a fake agent and a temporary Copilot config folder, so your real settings are not touched.
 
 ## License
 
