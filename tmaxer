@@ -185,7 +185,7 @@ hook_pre_tool_use() {
   queue_event approval "$id" "$(jq -cn --arg id "$id" --arg w "$TMAXER_WORKER" --arg tool "$tool" \
     --arg cmd "$cmd" --arg path "$path" '{kind: "approval", id: $id, worker: $w, tool: $tool, command: $cmd, path: $path}')"
   i=0
-  while [ "$i" -lt "$APPROVAL_TIMEOUT" ]; do
+  while [ "$i" -lt $((APPROVAL_TIMEOUT * 10)) ]; do
     if [ -s "$TMAXER_DIR/decisions/$id" ]; then
       dec=$(head -n 1 "$TMAXER_DIR/decisions/$id")
       set_title "busy"
@@ -203,7 +203,7 @@ hook_pre_tool_use() {
       esac
       return 0
     fi
-    sleep 1
+    sleep 0.1
     i=$((i + 1))
   done
   set_title "busy"
@@ -294,12 +294,13 @@ cmd_send() {
   if [ -n "$pane" ] && tmux_up; then
     tmux -L "$SOCK" select-pane -t "$pane" -T "$w busy"
     tmux -L "$SOCK" send-keys -t "$pane" -l "$nudge"
-    sleep 1
+    sleep 0.3
     tmux -L "$SOCK" send-keys -t "$pane" Enter
-    sleep 3
-    if ! tmux -L "$SOCK" capture-pane -p -t "$pane" | grep -q 'Working'; then
-      tmux -L "$SOCK" send-keys -t "$pane" Enter
-    fi
+    for i in $(seq 1 15); do
+      tmux -L "$SOCK" capture-pane -p -t "$pane" | grep -q 'Working' && break
+      [ "$i" -eq 5 ] && tmux -L "$SOCK" send-keys -t "$pane" Enter
+      sleep 0.2
+    done
   fi
   echo "$id"
 }
@@ -317,7 +318,7 @@ cmd_wait() {
     done
     [ "$n" -gt 0 ] && return 0
     tmux_up || return 1
-    sleep 2
+    sleep 0.2
   done
 }
 
