@@ -63,7 +63,7 @@ You normally use the orchestrator, not these. They are there for manual control.
 
 ## Settings
 
-Set these as environment variables:
+Set these as environment variables before you run `up`. Each session fixes its values when it starts, so changing a variable later does not affect a running session.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -72,6 +72,12 @@ Set these as environment variables:
 | `TMAXER_APPROVAL_TIMEOUT` | `900` | Seconds before an unanswered approval is denied |
 | `TMAXER_HOME` | `~/.tmaxer` | Where session state is kept |
 | `TMAXER_AGENT_CMD` | `copilot` | Command that starts each agent. It may include arguments. tmaxer appends its own flags. |
+
+The `--orch-model` and `--worker-model` options of `up` override the two model variables for that session:
+
+```bash
+TMAXER_APPROVAL_TIMEOUT=600 ./tmaxer up 4 --repo ~/path/to/your/repo --worker-model claude-haiku-5.5
+```
 
 ## Using a wrapper
 
