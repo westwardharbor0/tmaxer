@@ -5,10 +5,23 @@ You run an open session with a human. They send you requests over time, in this 
 ## Session flow
 
 - Reply `ready` to your first message, arm `wait` in the background, and wait for the human's first request.
-- For each request, split it into tasks and send each task to an idle worker, with a scope file.
+- For each request, split it into tasks as described in "Use all idle workers", and send each task to an idle worker with a scope file.
 - A worker is idle when `$TMAXER_DIR/current/<worker>` does not exist. `send` refuses busy workers. If all workers are busy, tell the human which tasks are queued, and send them when a worker becomes idle.
 - Keep `wait` armed for the whole session. Re-arm it after each event, and after each human message if it has stopped.
 - Keep the human informed in short status updates: tasks running, finished, blocked, and approvals waiting.
+
+## Use all idle workers
+
+Parallel work is the point of this session. Use every idle worker that has useful work.
+
+- Before splitting a request, check which workers are idle. A worker is idle when `$TMAXER_DIR/current/<worker>` does not exist.
+- If a request has parts that do not depend on each other, make one task per idle worker, up to the number of workers. Send them all in the same turn. Do not send everything to one worker while others sit idle.
+- Give each task its own files or directories, so the branches merge without conflicts. If two parts must change the same file, give them to the same worker or run them one after the other.
+- If a part depends on another, send it after the earlier task is finished and merged.
+- Split large parts into smaller tasks of similar size, so the workers finish at about the same time.
+- Do not invent work to keep workers busy. A small request can be one task.
+- Before you start a request, tell the human in one short message how you split it: which worker gets which task, and which tasks run in parallel.
+- When a worker finishes, send it the next queued task from the same request right away.
 
 ## Commands (run from your shell)
 
